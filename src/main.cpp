@@ -5,6 +5,7 @@
 #include <WiFi.h>
 #include <AsyncTCP.h>
 #include <ESPAsyncWebServer.h>
+#include <Preferences.h>
 #include <time.h>
 #include <piezo-music.h>
 #include <example-music.h>
@@ -14,6 +15,7 @@ void tareaLCD(void* parametro);
 void copiarSecuencia();
 void ejecutarAccion(byte accion);
 void sincronizarNTP(String ssid_ext, String pass_ext);
+void actualizarProximoEvento();
 // ==================================================
 
 // =================== PINES ===================
@@ -56,8 +58,9 @@ int canal = 1;
 
 // =================== OBJETOS PERIFÉRICOS ===================
 RTC_DS3231 rtc;
-LiquidCrystal_I2C lcd(0x27, 16, 2);
+LiquidCrystal_I2C lcd(0x27, 20, 4);
 AsyncWebServer servidor(80);
+Preferences prefs;
 // ===========================================================
 
 // =================== WIFI AP ===================
@@ -76,6 +79,15 @@ volatile bool solicitudSyncNTP = false;
 String ssidNTP = "";
 String passNTP = "";
 String resultadoSync = "";  // Muestra el resultado del último intento en la página web.
+
+// Cadenas para las filas 2 y 3 del LCD (próximo evento). Escritas desde core 0.
+volatile char lcdProxLine1[21] = "Iniciando...        ";
+volatile char lcdProxLine2[21] = "                    ";
+
+// Control de arranque y detección de cambio de minuto.
+bool arranqueTerminado  = false;
+int  ultimoMinutoRTC    = -1;
+int  ultimoDiaRTC       = -1;
 
 // =====================================================================
 // STRUCT ALARMA
@@ -110,34 +122,37 @@ struct Alarma {
 // =====================================================================
 
 Alarma sec1[] = {
-  {1, 7,  0,  {RELE}},
-  {1, 7,  30, {LED_1}},
-  {1, 8,  0,  {TONO_1000HZ}},
-  {1, 8,  30, {LED_2}},
-  {1, 9,  0,  {TONO_1200HZ}},
-  {1, 9,  30, {LED_3}},
-  {1, 13, 0,  {RELE}},
-  {1, 13, 30, {SEQ_LEDS}},
-  {1, 14, 0,  {TONO_800HZ}},
-  {1, 14, 30, {PARPADEO_LEDS}},
-  {1, 15, 0,  {TONO_1500HZ}},
-  {1, 15, 30, {MELODIA_ZELDA}},
-  {1, 22, 27,  {RELE}},
-  {1, 22, 28, {LED_2,PARPADEO_LEDS}},
-  {1, 22, 29,  {TONO_1000HZ,TONO_1200HZ}},
-  {1, 22, 30, {MELODIA_TETRIS}},
-  {1, 22, 35,  {MELODIA_MARIO,MELODIA_TETRIS,MELODIA_MARIO}},
-  {6, 7,  0,  {RELE}},
-  {6, 7,  30, {LED_1}},
-  {6, 8,  0,  {TONO_1000HZ}},
-  {6, 8,  30, {LED_2}},
-  {6, 13, 0,  {RELE}},
-  {6, 13, 30, {LED_3}},
-  {6, 14, 0,  {TONO_1200HZ}},
-  {6, 14, 30, {SEQ_LEDS}},
-  {6, 19, 0,  {RELE}},
-  {6, 19, 30, {PARPADEO_LEDS}},
-  {6, 20, 0,  {MELODIA_ZELDA}},
+    {1, 7, 0, {RELE}},
+    {1, 11, 57, {RELE,MELODIA_MARIO, MELODIA_ZELDA}},
+    {1, 11, 10, {RELE}},
+    {1, 8, 30, {LED_2}},
+    {1, 9, 0, {TONO_1200HZ}},
+    {1, 9, 30, {LED_3}},
+    {1, 13, 0, {RELE}},
+    {1, 13, 30, {SEQ_LEDS}},
+    {1, 14, 0, {TONO_800HZ}},
+    {1, 14, 30, {PARPADEO_LEDS}},
+    {1, 15, 0, {TONO_1500HZ}},
+    {1, 15, 30, {MELODIA_ZELDA}},
+    {1, 11, 17, {RELE}},
+    {1, 22, 28, {LED_2, PARPADEO_LEDS}},
+    {1, 22, 29, {TONO_1000HZ, TONO_1200HZ}},
+    {1, 22, 30, {MELODIA_TETRIS}},
+    {1, 22, 35, {MELODIA_MARIO, MELODIA_TETRIS}},
+    {6, 6, 0, {RELE}},
+    {6, 7, 30, {LED_1}},
+    {6, 8, 0, {TONO_1000HZ}},
+    {6, 8, 30, {LED_2}},
+    {6, 13, 0, {RELE}},
+    {6, 13, 30, {LED_3}},
+    {6, 14, 0, {TONO_1200HZ}},
+    {6, 14, 30, {SEQ_LEDS}},
+    {6, 19, 0, {RELE}},
+    {6, 19, 30, {PARPADEO_LEDS}},
+    {1, 9, 46, {TONO_1200HZ,MELODIA_TETRIS,RELE}},
+    {1, 9, 43, {RELE,MELODIA_MARIO}},
+    {1, 9, 44, {RELE,MELODIA_ZELDA,LED_2}},
+    {1, 9, 45, {SEQ_LEDS,RELE,LED_1}}
 };
 
 Alarma sec2[] = {
@@ -169,6 +184,7 @@ Alarma sec2[] = {
   {6, 18, 0,  {RELE}},
   {6, 18, 30, {PARPADEO_LEDS}},
   {1, 22,6,  {MELODIA_ZELDA,SEQ_LEDS}},
+  {6, 18, 0,  {RELE}}
 };
 
 // Totales calculados automáticamente a partir del tamaño real de cada arreglo.
@@ -187,9 +203,17 @@ int    totalAlarmas = 0;  // Se actualiza en copiarSecuencia().
 // ======================T===============================================
 
 void activarRele() {
-  digitalWrite(PIN_RELE, LOW);
-  delay(DURACION_ACCION_MS);
-  digitalWrite(PIN_RELE, HIGH);
+  pinMode(PIN_RELE, OUTPUT);  // reforzar modo salida por si algo lo cambió
+  Serial.println("RELE: iniciando pulsos");
+  for (int i = 0; i < 3; i++) {
+    Serial.printf("RELE: pulso %d ON\n", i + 1);
+    digitalWrite(PIN_RELE, HIGH);
+    delay(2000);
+    Serial.printf("RELE: pulso %d OFF\n", i + 1);
+    digitalWrite(PIN_RELE, LOW);
+    delay(2000);
+  }
+  Serial.println("RELE: fin");
 }
 
 void encenderLED(int index) {
@@ -271,6 +295,7 @@ void reproducirMelodia_Mario() {
 // DISPATCHER: llama a la función de la acción indicada.
 // =====================================================================
 void ejecutarAccion(byte accion) {
+  Serial.printf("ejecutarAccion: %d\n", accion);
   switch (accion) {
     case RELE:          activarRele();           break;
     case LED_1:         encenderLED(0);          break;
@@ -343,18 +368,76 @@ void sincronizarNTP(String ssid_ext, String pass_ext) {
       timeinfo.tm_min,
       timeinfo.tm_sec
     ));
+    // Guardar credenciales en NVS para reconexión automática al arrancar.
+    prefs.begin("wifi-cred", false);
+    prefs.putString("ssid", ssid_ext);
+    prefs.putString("pass", pass_ext);
+    prefs.end();
+    // Guardar el epoch en flash como respaldo para arranques sin internet.
+    prefs.begin("rtc-backup", false);
+    prefs.putUInt("epoch", rtc.now().unixtime());
+    prefs.end();
     char buf[20];
     sprintf(buf, "%02d/%02d/%04d %02d:%02d",
       timeinfo.tm_mday, timeinfo.tm_mon + 1, timeinfo.tm_year + 1900,
       timeinfo.tm_hour, timeinfo.tm_min);
     resultadoSync = "Hora sincronizada: " + String(buf);
     Serial.println("NTP: " + resultadoSync);
+    actualizarProximoEvento();
   } else {
     resultadoSync = "WiFi OK pero NTP no respondio. Reintenta.";
     Serial.println("NTP: " + resultadoSync);
   }
 
   WiFi.disconnect();
+}
+
+
+// Calcula el próximo evento y actualiza las cadenas para el LCD.
+void actualizarProximoEvento() {
+  DateTime ahora = rtc.now();
+  int dA = ahora.dayOfTheWeek();
+  int hA = ahora.hour();
+  int mA = ahora.minute();
+
+  const char* diasCortos[]  = {"Dom","Lun","Mar","Mie","Jue","Vie","Sab"};
+  const char* nombreAccion[] = {
+    "","Rele","LED 1","LED 2","LED 3","Seq.LEDs","Parpadeo",
+    "800Hz","1kHz","1.2kHz","1.5kHz","Zelda","Twinkle","Tetris","Mario"
+  };
+
+  for (int off = 0; off < 7; off++) {
+    int dC = (dA + off) % 7;
+    bool hayEnEsteDia = false;
+    int mejorHora = 99, mejorMin = 99;
+    byte mejorTipo = 255;
+
+    for (int i = 0; i < totalAlarmas; i++) {
+      Alarma a = elegida[i];
+      bool diaOk = (a.dia == 1 && dC >= 1 && dC <= 5) || (a.dia == 6 && dC == 6);
+      if (!diaOk) continue;
+      if (off == 0) {
+        if (a.hora < hA) continue;
+        if (a.hora == hA && a.minuto <= mA) continue;
+      }
+      if (!hayEnEsteDia || a.hora < mejorHora || (a.hora == mejorHora && a.minuto < mejorMin)) {
+        hayEnEsteDia = true;
+        mejorHora    = a.hora;
+        mejorMin     = a.minuto;
+        mejorTipo    = a.acciones[0];
+      }
+    }
+
+    if (hayEnEsteDia) {
+      snprintf((char*)lcdProxLine1, 21, "Prox: %s %02d:%02d     ", diasCortos[dC], mejorHora, mejorMin);
+      const char* nombre = (mejorTipo >= 1 && mejorTipo <= 14) ? nombreAccion[mejorTipo] : "Evento";
+      snprintf((char*)lcdProxLine2, 21, "%-20s", nombre);
+      return;
+    }
+  }
+
+  snprintf((char*)lcdProxLine1, 21, "Sin proximos eventos");
+  snprintf((char*)lcdProxLine2, 21, "                    ");
 }
 
 
@@ -370,16 +453,27 @@ void setup() {
     while (true);
   }
 
-  // Ajusta el RTC solo si la batería falló o el año está claramente mal.
-  // Con la sincronización NTP ya no hace falta ajustarlo manualmente.
+  // Ajusta el RTC si la batería falló o el tiempo es anterior al de compilación.
+  // Orden de prioridad: NTP (al final del setup) > respaldo NVS > tiempo de compilación.
   DateTime now = rtc.now();
-  if (rtc.lostPower() || now.year() < 2024) {
-    rtc.adjust(DateTime(F(__DATE__), F(__TIME__)));
+  DateTime compilado(F(__DATE__), F(__TIME__));
+  if (rtc.lostPower() || now.unixtime() < compilado.unixtime()) {
+    Serial.println("RTC: tiempo invalido (bateria posiblemente agotada). Buscando respaldo...");
+    prefs.begin("rtc-backup", true);
+    uint32_t ultimoNTP = prefs.getUInt("epoch", 0);
+    prefs.end();
+    if (ultimoNTP > compilado.unixtime()) {
+      rtc.adjust(DateTime(ultimoNTP));
+      Serial.println("RTC: restaurado desde ultimo NTP guardado en flash");
+    } else {
+      rtc.adjust(compilado);
+      Serial.println("RTC: usando hora de compilacion como ultimo recurso");
+    }
   }
 
   pinMode(PIN_BUZZER, OUTPUT);
   pinMode(PIN_RELE, OUTPUT);
-  digitalWrite(PIN_RELE, HIGH);
+  digitalWrite(PIN_RELE, LOW);
 
   for (int i = 0; i < 3; i++) {
     pinMode(pinesLED[i], OUTPUT);
@@ -495,6 +589,7 @@ void setup() {
     if (request->hasParam("ahora")) {
       Eleccion = request->getParam("ahora")->value().toInt();
       copiarSecuencia();
+      actualizarProximoEvento();
     }
     if (request->hasParam("luego")) {
       EleccionProximaSemana = request->getParam("luego")->value().toInt();
@@ -520,24 +615,42 @@ void setup() {
     request->send(200, "text/html", html);
   });
 
+  // Intentar sincronización NTP automática con las últimas credenciales guardadas.
+  prefs.begin("wifi-cred", true);
+  String savedSSID = prefs.getString("ssid", "");
+  String savedPass = prefs.getString("pass", "");
+  prefs.end();
+  if (savedSSID.length() > 0) {
+    Serial.println("Auto-NTP: usando credenciales guardadas para " + savedSSID);
+    sincronizarNTP(savedSSID, savedPass);
+  }
+
+  actualizarProximoEvento();
   servidor.begin();
 }
 
 
 void loop() {
-  DateTime ahora     = rtc.now();
-  int diaActual      = ahora.dayOfTheWeek();  // 0=Domingo … 6=Sábado
-  int horaActual     = ahora.hour();
-  int minutoActual   = ahora.minute();
+  DateTime ahora   = rtc.now();
+  int diaActual    = ahora.dayOfTheWeek();  // 0=Domingo … 6=Sábado
+  int horaActual   = ahora.hour();
+  int minutoActual = ahora.minute();
 
   // Reset de actuadores al inicio de cada ciclo.
-  digitalWrite(PIN_RELE, HIGH);
+  digitalWrite(PIN_RELE, LOW);
   for (int i = 0; i < 3; i++) digitalWrite(pinesLED[i], LOW);
   noTone(PIN_BUZZER);
 
-  // Ignorar alarmas durante los primeros 65 s tras el encendido.
-  // Evita disparar el evento del minuto actual al arrancar el dispositivo.
-  if (millis() < 65000UL) {
+  // Al arrancar: esperar 3 s para que los periféricos estabilicen, luego marcar
+  // el minuto actual como ya procesado para no disparar un evento a medias.
+  if (!arranqueTerminado) {
+    if (millis() < 3000UL) {
+      delay(200);
+      return;
+    }
+    ultimoMinutoRTC   = minutoActual;
+    ultimoDiaRTC      = diaActual;
+    arranqueTerminado = true;
     delay(200);
     return;
   }
@@ -548,23 +661,25 @@ void loop() {
     sincronizarNTP(ssidNTP, passNTP);
   }
 
-  // Recorrer las alarmas de la secuencia activa.
-  for (int i = 0; i < totalAlarmas; i++) {
-    Alarma a = elegida[i];
+  // Detectar transición de minuto y disparar el evento exactamente al :00.
+  if (minutoActual != ultimoMinutoRTC || diaActual != ultimoDiaRTC) {
+    ultimoMinutoRTC = minutoActual;
+    ultimoDiaRTC    = diaActual;
+    Serial.printf("Nuevo minuto: dia=%d %02d:%02d\n", diaActual, horaActual, minutoActual);
 
-    // dia=1 cubre Lunes(1) a Viernes(5). dia=6 es solo Sábado.
-    bool diaCoincide = (a.dia == 1 && diaActual >= 1 && diaActual <= 5) ||
-                       (a.dia == 6 && diaActual == 6);
+    for (int i = 0; i < totalAlarmas; i++) {
+      Alarma a = elegida[i];
+      bool diaCoincide = (a.dia == 1 && diaActual >= 1 && diaActual <= 5) ||
+                         (a.dia == 6 && diaActual == 6);
 
-    if (diaCoincide && a.hora == horaActual && a.minuto == minutoActual) {
-      // Ejecutar cada acción del evento en orden hasta encontrar SIN_ACCION.
-      for (int j = 0; j < 10; j++) {
-        if (a.acciones[j] == SIN_ACCION) break;
-        ejecutarAccion(a.acciones[j]);
+      if (diaCoincide && a.hora == horaActual && a.minuto == minutoActual) {
+        Serial.printf("Evento encontrado: accion[0]=%d\n", a.acciones[0]);
+        for (int j = 0; j < 10 && a.acciones[j] != SIN_ACCION; j++) {
+          ejecutarAccion(a.acciones[j]);
+        }
+        actualizarProximoEvento();
+        break;
       }
-      // Esperar hasta que cambie el minuto para no volver a disparar este mismo evento.
-      while (rtc.now().minute() == minutoActual) delay(200);
-      break;
     }
   }
 
@@ -579,8 +694,9 @@ void loop() {
 }
 
 
-// TAREA LCD: actualiza el display cada segundo y parpadea el backlight
-// (300 ms encendido / 50 ms apagado) para evitar desgaste del panel.
+// TAREA LCD: actualiza las 4 filas cada segundo.
+// Filas 0-1: fecha y hora. Filas 2-3: próximo evento (calculado en core 0).
+// Parpadeo de backlight: 300 ms encendido / 50 ms apagado para evitar desgaste.
 void tareaLCD(void* parametro) {
   unsigned long ultimaActualizacion = 0;
   unsigned long ultimoParpadeo      = 0;
@@ -589,20 +705,24 @@ void tareaLCD(void* parametro) {
   for (;;) {
     unsigned long t = millis();
 
-    // Actualizar fecha y hora en pantalla cada segundo.
     if (t - ultimaActualizacion >= 1000) {
       ultimaActualizacion = t;
       DateTime ahora = rtc.now();
+      char linea[21];
 
       lcd.setCursor(0, 0);
-      char fecha[17];
-      sprintf(fecha, "%02d/%02d/%04d", ahora.day(), ahora.month(), ahora.year());
-      lcd.print(fecha);
+      sprintf(linea, "%02d/%02d/%04d          ", ahora.day(), ahora.month(), ahora.year());
+      lcd.print(linea);
 
       lcd.setCursor(0, 1);
-      char hora[17];
-      sprintf(hora, "%02d:%02d:%02d", ahora.hour(), ahora.minute(), ahora.second());
-      lcd.print(hora);
+      sprintf(linea, "%02d:%02d:%02d            ", ahora.hour(), ahora.minute(), ahora.second());
+      lcd.print(linea);
+
+      lcd.setCursor(0, 2);
+      lcd.print((const char*)lcdProxLine1);
+
+      lcd.setCursor(0, 3);
+      lcd.print((const char*)lcdProxLine2);
     }
 
     // Parpadeo del backlight: 300 ms encendido, 50 ms apagado.
