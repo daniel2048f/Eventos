@@ -727,11 +727,11 @@ void tareaLCD(void* parametro) {
 
     // Parpadeo del backlight: 300 ms encendido, 50 ms apagado.
     unsigned long tiempoEnEstado = t - ultimoParpadeo;
-    if (luzEncendida && tiempoEnEstado >= 300) {
+    if (luzEncendida && tiempoEnEstado >= 80) {
       lcd.noBacklight();
       luzEncendida = false;
       ultimoParpadeo = t;
-    } else if (!luzEncendida && tiempoEnEstado >= 50) {
+    } else if (!luzEncendida && tiempoEnEstado >= 10) {
       lcd.backlight();
       luzEncendida = true;
       ultimoParpadeo = t;
