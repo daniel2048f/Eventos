@@ -209,4 +209,5 @@
  .pio/libdeps/esp32dev/ESP\ Async\ WebServer/src/AsyncWebSynchronization.h \
  .pio/libdeps/esp32dev/ESP\ Async\ WebServer/src/AsyncEventSource.h \
  C:/Users/danic/.platformio/packages/framework-arduinoespressif32/libraries/Preferences/src/Preferences.h \
+ C:/Users/danic/.platformio/packages/framework-arduinoespressif32/tools/sdk/esp32/include/esp_system/include/esp_task_wdt.h \
  include/piezo-music.h include/example-music.h

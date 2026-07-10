@@ -7,6 +7,7 @@
 #include <ESPAsyncWebServer.h>
 #include <Preferences.h>
 #include <time.h>
+#include <esp_task_wdt.h>
 #include <piezo-music.h>
 #include <example-music.h>
 
@@ -16,13 +17,27 @@ void copiarSecuencia();
 void ejecutarAccion(byte accion);
 void sincronizarNTP(String ssid_ext, String pass_ext);
 void actualizarProximoEvento();
+void recuperarBusI2C();
+bool iniciarI2C();
+DateTime rtcNowSafe();
+bool rtcBeginSafe();
+bool rtcLostPowerSafe();
+void rtcAdjustSafe(const DateTime &dt);
+bool fechaValida(const DateTime &dt);
 // ==================================================
 
 // =================== PINES ===================
 #define PIN_BUZZER 32
 #define PIN_RELE   33
+#define PIN_I2C_SDA 21
+#define PIN_I2C_SCL 22
 const int pinesLED[] = {25, 26, 27};
 int canal = 1;
+
+// Tiempo máximo (s) que el watchdog deja correr una tarea sin que confirme
+// que sigue viva. Si algo se bloquea más de esto, el ESP32 se reinicia solo
+// en vez de quedar congelado esperando un reset manual.
+#define WDT_TIMEOUT_S 20
 // =============================================
 
 // =====================================================================
@@ -61,6 +76,13 @@ RTC_DS3231 rtc;
 LiquidCrystal_I2C lcd(0x27, 20, 4);
 AsyncWebServer servidor(80);
 Preferences prefs;
+
+// El bus I2C es compartido por el RTC y el LCD, y accedido concurrentemente
+// desde el loop() (core 0), la tarea del LCD (core 1) y el servidor web (su
+// propia tarea). Sin este mutex, dos accesos simultáneos pueden intercalarse
+// a mitad de una transacción y corromper lo que se lee o se escribe —
+// causa típica de caracteres basura ("?") en el LCD y bloqueos del bus.
+SemaphoreHandle_t i2cMutex;
 // ===========================================================
 
 // =================== WIFI AP ===================
@@ -88,6 +110,8 @@ volatile char lcdProxLine2[21] = "                    ";
 bool arranqueTerminado  = false;
 int  ultimoMinutoRTC    = -1;
 int  ultimoDiaRTC       = -1;
+int  ultimoDiaSyncAuto  = -1;  // evita repetir la resincronizacion NTP diaria en el mismo dia
+unsigned long ultimoRespaldoEpoch = 0;  // millis() del ultimo respaldo de hora en NVS
 
 // =====================================================================
 // STRUCT ALARMA
@@ -152,7 +176,8 @@ Alarma sec1[] = {
     {1, 9, 46, {TONO_1200HZ,MELODIA_TETRIS,RELE}},
     {1, 9, 43, {RELE,MELODIA_MARIO}},
     {1, 9, 44, {RELE,MELODIA_ZELDA,LED_2}},
-    {1, 9, 45, {SEQ_LEDS,RELE,LED_1}}
+    {1, 9, 45, {SEQ_LEDS,RELE,LED_1}},
+    {1, 8, 11, {MELODIA_MARIO, RELE}},
 };
 
 Alarma sec2[] = {
@@ -340,6 +365,7 @@ void sincronizarNTP(String ssid_ext, String pass_ext) {
   unsigned long inicio = millis();
   while (WiFi.status() != WL_CONNECTED && millis() - inicio < 20000UL) {
     delay(500);
+    esp_task_wdt_reset();
   }
 
   if (WiFi.status() != WL_CONNECTED) {
@@ -357,10 +383,11 @@ void sincronizarNTP(String ssid_ext, String pass_ext) {
   unsigned long esperaInicio = millis();
   while (!getLocalTime(&timeinfo) && millis() - esperaInicio < 10000UL) {
     delay(500);
+    esp_task_wdt_reset();
   }
 
   if (getLocalTime(&timeinfo) && timeinfo.tm_year > 100) {
-    rtc.adjust(DateTime(
+    rtcAdjustSafe(DateTime(
       timeinfo.tm_year + 1900,
       timeinfo.tm_mon + 1,
       timeinfo.tm_mday,
@@ -375,7 +402,7 @@ void sincronizarNTP(String ssid_ext, String pass_ext) {
     prefs.end();
     // Guardar el epoch en flash como respaldo para arranques sin internet.
     prefs.begin("rtc-backup", false);
-    prefs.putUInt("epoch", rtc.now().unixtime());
+    prefs.putUInt("epoch", rtcNowSafe().unixtime());
     prefs.end();
     char buf[20];
     sprintf(buf, "%02d/%02d/%04d %02d:%02d",
@@ -395,7 +422,8 @@ void sincronizarNTP(String ssid_ext, String pass_ext) {
 
 // Calcula el próximo evento y actualiza las cadenas para el LCD.
 void actualizarProximoEvento() {
-  DateTime ahora = rtc.now();
+  DateTime ahora = rtcNowSafe();
+  if (!fechaValida(ahora)) return;  // lectura I2C corrupta: se reintenta en la próxima llamada
   int dA = ahora.dayOfTheWeek();
   int hA = ahora.hour();
   int mA = ahora.minute();
@@ -441,34 +469,167 @@ void actualizarProximoEvento() {
 }
 
 
+// =====================================================================
+// ROBUSTEZ I2C / RTC
+// El bus I2C (RTC + LCD) es el punto más frágil del sistema: un glitch
+// eléctrico, un accesor concurrente o un slave que se cuelga puede dejar
+// el bus atascado o corromper una lectura/escritura. Las funciones de
+// abajo centralizan el acceso (con mutex) y agregan recuperación activa.
+// =====================================================================
+
+// Libera un bus I2C trabado (un esclavo reteniendo SDA en bajo) generando
+// hasta 9 pulsos de reloj manuales y una condición STOP. Es la técnica
+// estándar de recuperación de bus I2C. Debe llamarse ANTES de Wire.begin().
+void recuperarBusI2C() {
+  pinMode(PIN_I2C_SDA, INPUT_PULLUP);
+  pinMode(PIN_I2C_SCL, INPUT_PULLUP);
+  delay(10);
+  if (digitalRead(PIN_I2C_SDA) == HIGH) return;  // El bus ya está libre.
+
+  Serial.println("I2C: bus bloqueado, intentando recuperacion...");
+  pinMode(PIN_I2C_SCL, OUTPUT);
+  for (int i = 0; i < 9 && digitalRead(PIN_I2C_SDA) == LOW; i++) {
+    digitalWrite(PIN_I2C_SCL, LOW);
+    delayMicroseconds(5);
+    digitalWrite(PIN_I2C_SCL, HIGH);
+    delayMicroseconds(5);
+  }
+  // Condición STOP manual: SDA sube mientras SCL está en alto.
+  pinMode(PIN_I2C_SDA, OUTPUT);
+  digitalWrite(PIN_I2C_SDA, LOW);
+  delayMicroseconds(5);
+  digitalWrite(PIN_I2C_SCL, HIGH);
+  delayMicroseconds(5);
+  digitalWrite(PIN_I2C_SDA, HIGH);
+  delayMicroseconds(5);
+  pinMode(PIN_I2C_SDA, INPUT_PULLUP);
+  pinMode(PIN_I2C_SCL, INPUT_PULLUP);
+  delay(10);
+}
+
+// (Re)inicializa el periférico I2C con un timeout acotado, para que un
+// fallo del bus nunca bloquee una transacción indefinidamente.
+bool iniciarI2C() {
+  recuperarBusI2C();
+  bool ok = Wire.begin(PIN_I2C_SDA, PIN_I2C_SCL);
+  Wire.setTimeOut(200);  // ms — evita que un Wire.* se cuelgue para siempre
+  return ok;
+}
+
+DateTime rtcNowSafe() {
+  xSemaphoreTake(i2cMutex, portMAX_DELAY);
+  DateTime dt = rtc.now();
+  xSemaphoreGive(i2cMutex);
+  return dt;
+}
+
+bool rtcBeginSafe() {
+  xSemaphoreTake(i2cMutex, portMAX_DELAY);
+  bool ok = rtc.begin();
+  xSemaphoreGive(i2cMutex);
+  return ok;
+}
+
+bool rtcLostPowerSafe() {
+  xSemaphoreTake(i2cMutex, portMAX_DELAY);
+  bool lp = rtc.lostPower();
+  xSemaphoreGive(i2cMutex);
+  return lp;
+}
+
+void rtcAdjustSafe(const DateTime &dt) {
+  xSemaphoreTake(i2cMutex, portMAX_DELAY);
+  rtc.adjust(dt);
+  xSemaphoreGive(i2cMutex);
+}
+
+// Descarta lecturas del RTC evidentemente corruptas (glitch de I2C durante
+// la lectura) para que nunca disparen un evento equivocado ni pinten
+// basura en el LCD. Una lectura inválida se ignora y se reintenta después.
+bool fechaValida(const DateTime &dt) {
+  return dt.year() >= 2020 && dt.year() <= 2099 &&
+         dt.month() >= 1 && dt.month() <= 12 &&
+         dt.day() >= 1 && dt.day() <= 31 &&
+         dt.hour() <= 23 && dt.minute() <= 59 && dt.second() <= 59;
+}
+
+
 void setup() {
   Serial.begin(115200);
-  Wire.begin();
+
+  i2cMutex = xSemaphoreCreateMutex();
+
+  // El watchdog se activa ya en setup(): si el RTC/LCD dejan alguna
+  // operación bloqueada más de WDT_TIMEOUT_S, el equipo se reinicia solo.
+  esp_task_wdt_init(WDT_TIMEOUT_S, true);
+  esp_task_wdt_add(NULL);  // suscribe la tarea de setup()/loop()
+
+  iniciarI2C();
   lcd.init();
   lcd.backlight();
   copiarSecuencia();
 
-  if (!rtc.begin()) {
-    Serial.println("No se detecta el RTC");
-    while (true);
+  // Reintenta detectar el RTC varias veces, recuperando el bus I2C entre
+  // intentos. Si sigue sin responder, el equipo se reinicia solo en vez de
+  // quedar congelado esperando un reset manual (antes: while(true) eterno).
+  bool rtcOk = false;
+  for (int intento = 0; intento < 5 && !rtcOk; intento++) {
+    rtcOk = rtcBeginSafe();
+    if (!rtcOk) {
+      Serial.printf("RTC: no responde (intento %d/5)\n", intento + 1);
+      iniciarI2C();
+      delay(300);
+    }
+  }
+  if (!rtcOk) {
+    Serial.println("RTC: sin respuesta tras varios intentos. Reiniciando...");
+    lcd.setCursor(0, 0);
+    lcd.print("Error RTC.");
+    lcd.setCursor(0, 1);
+    lcd.print("Reiniciando...");
+    delay(2000);
+    esp_restart();
   }
 
   // Ajusta el RTC si la batería falló o el tiempo es anterior al de compilación.
   // Orden de prioridad: NTP (al final del setup) > respaldo NVS > tiempo de compilación.
-  DateTime now = rtc.now();
+  DateTime now = rtcNowSafe();
   DateTime compilado(F(__DATE__), F(__TIME__));
-  if (rtc.lostPower() || now.unixtime() < compilado.unixtime()) {
-    Serial.println("RTC: tiempo invalido (bateria posiblemente agotada). Buscando respaldo...");
+  bool bateriaRtcAgotada = rtcLostPowerSafe();
+  if (bateriaRtcAgotada || now.unixtime() < compilado.unixtime()) {
+    if (bateriaRtcAgotada) {
+      Serial.println("RTC: ADVERTENCIA - la bateria de respaldo (CR2032) parece agotada o ausente.");
+      Serial.println("RTC: perdera la hora cada vez que se desenergice hasta que se reemplace.");
+    } else {
+      Serial.println("RTC: tiempo invalido (bateria posiblemente agotada). Buscando respaldo...");
+    }
     prefs.begin("rtc-backup", true);
     uint32_t ultimoNTP = prefs.getUInt("epoch", 0);
     prefs.end();
     if (ultimoNTP > compilado.unixtime()) {
-      rtc.adjust(DateTime(ultimoNTP));
+      rtcAdjustSafe(DateTime(ultimoNTP));
       Serial.println("RTC: restaurado desde ultimo NTP guardado en flash");
     } else {
-      rtc.adjust(compilado);
+      rtcAdjustSafe(compilado);
       Serial.println("RTC: usando hora de compilacion como ultimo recurso");
     }
+  }
+
+  // Aviso visual: si la pila del RTC está agotada, ningún respaldo por
+  // software puede mantener la hora corriendo mientras el equipo está
+  // desenergizado. Se avisa en pantalla para que se reemplace la CR2032.
+  if (bateriaRtcAgotada) {
+    lcd.clear();
+    lcd.setCursor(0, 0);
+    lcd.print("AVISO: bateria RTC");
+    lcd.setCursor(0, 1);
+    lcd.print("agotada o ausente");
+    lcd.setCursor(0, 2);
+    lcd.print("Reemplazar CR2032");
+    lcd.setCursor(0, 3);
+    lcd.print("Hora puede fallar");
+    delay(4000);
+    lcd.clear();
   }
 
   pinMode(PIN_BUZZER, OUTPUT);
@@ -493,7 +654,7 @@ void setup() {
 
     // Calcular el próximo evento
     String nombresDia[7] = {"Domingo","Lunes","Martes","Miércoles","Jueves","Viernes","Sábado"};
-    DateTime ahora = rtc.now();
+    DateTime ahora = rtcNowSafe();
     int dA = ahora.dayOfTheWeek();
     int hA = ahora.hour();
     int mA = ahora.minute();
@@ -631,7 +792,16 @@ void setup() {
 
 
 void loop() {
-  DateTime ahora   = rtc.now();
+  esp_task_wdt_reset();
+
+  DateTime ahora = rtcNowSafe();
+  if (!fechaValida(ahora)) {
+    // Lectura I2C corrupta (glitch de bus): no dispara eventos ni actualiza
+    // nada con datos basura. Se reintenta en el siguiente ciclo (~200 ms).
+    Serial.println("RTC: lectura invalida, se ignora este ciclo");
+    delay(200);
+    return;
+  }
   int diaActual    = ahora.dayOfTheWeek();  // 0=Domingo … 6=Sábado
   int horaActual   = ahora.hour();
   int minutoActual = ahora.minute();
@@ -661,6 +831,33 @@ void loop() {
     sincronizarNTP(ssidNTP, passNTP);
   }
 
+  // Resincronización NTP automática diaria (03:00) con las últimas
+  // credenciales guardadas. Corrige deriva y compensa una eventual
+  // pérdida de hora del RTC (p.ej. bateria de respaldo agotada) sin
+  // esperar a que alguien reinicie el equipo o entre a la web.
+  if (horaActual == 3 && minutoActual == 0 && ultimoDiaSyncAuto != diaActual) {
+    ultimoDiaSyncAuto = diaActual;
+    prefs.begin("wifi-cred", true);
+    String s = prefs.getString("ssid", "");
+    String p = prefs.getString("pass", "");
+    prefs.end();
+    if (s.length() > 0) {
+      Serial.println("Auto-NTP: resincronizacion diaria (03:00)");
+      sincronizarNTP(s, p);
+    }
+  }
+
+  // Respaldo periódico de la hora actual en NVS (independiente del NTP),
+  // para que si el RTC pierde la hora al desenergizarse, el arranque
+  // siguiente recupere la hora más reciente posible en vez de caer a la
+  // fecha de compilación del firmware.
+  if (millis() - ultimoRespaldoEpoch >= 900000UL) {  // cada 15 min
+    ultimoRespaldoEpoch = millis();
+    prefs.begin("rtc-backup", false);
+    prefs.putUInt("epoch", ahora.unixtime());
+    prefs.end();
+  }
+
   // Detectar transición de minuto y disparar el evento exactamente al :00.
   if (minutoActual != ultimoMinutoRTC || diaActual != ultimoDiaRTC) {
     ultimoMinutoRTC = minutoActual;
@@ -676,6 +873,7 @@ void loop() {
         Serial.printf("Evento encontrado: accion[0]=%d\n", a.acciones[0]);
         for (int j = 0; j < 10 && a.acciones[j] != SIN_ACCION; j++) {
           ejecutarAccion(a.acciones[j]);
+          esp_task_wdt_reset();  // acciones largas (hasta ~12 s) no deben disparar el watchdog
         }
         actualizarProximoEvento();
         break;
@@ -689,7 +887,10 @@ void loop() {
   if (diaActual == 1 && horaActual == 0 && minutoActual == 0 && Eleccion != EleccionProximaSemana) {
     Eleccion = EleccionProximaSemana;
     copiarSecuencia();
-    delay(60000);
+    for (int s = 0; s < 60; s++) {
+      delay(1000);
+      esp_task_wdt_reset();
+    }
   }
 }
 
@@ -698,8 +899,11 @@ void loop() {
 // Filas 0-1: fecha y hora. Filas 2-3: próximo evento (calculado en core 0).
 // Parpadeo de backlight: 300 ms encendido / 50 ms apagado para evitar desgaste.
 void tareaLCD(void* parametro) {
+  esp_task_wdt_add(NULL);  // suscribe esta tarea al watchdog
+
   unsigned long ultimaActualizacion = 0;
   unsigned long ultimoParpadeo      = 0;
+  unsigned long ultimaReinit        = 0;
   bool luzEncendida = true;
 
   for (;;) {
@@ -707,26 +911,45 @@ void tareaLCD(void* parametro) {
 
     if (t - ultimaActualizacion >= 1000) {
       ultimaActualizacion = t;
+
+      xSemaphoreTake(i2cMutex, portMAX_DELAY);
       DateTime ahora = rtc.now();
-      char linea[21];
+      if (fechaValida(ahora)) {
+        char linea[21];
 
-      lcd.setCursor(0, 0);
-      sprintf(linea, "%02d/%02d/%04d          ", ahora.day(), ahora.month(), ahora.year());
-      lcd.print(linea);
+        lcd.setCursor(0, 0);
+        sprintf(linea, "%02d/%02d/%04d          ", ahora.day(), ahora.month(), ahora.year());
+        lcd.print(linea);
 
-      lcd.setCursor(0, 1);
-      sprintf(linea, "%02d:%02d:%02d            ", ahora.hour(), ahora.minute(), ahora.second());
-      lcd.print(linea);
+        lcd.setCursor(0, 1);
+        sprintf(linea, "%02d:%02d:%02d            ", ahora.hour(), ahora.minute(), ahora.second());
+        lcd.print(linea);
 
-      lcd.setCursor(0, 2);
-      lcd.print((const char*)lcdProxLine1);
+        lcd.setCursor(0, 2);
+        lcd.print((const char*)lcdProxLine1);
 
-      lcd.setCursor(0, 3);
-      lcd.print((const char*)lcdProxLine2);
+        lcd.setCursor(0, 3);
+        lcd.print((const char*)lcdProxLine2);
+      }
+      // Si la lectura del RTC vino corrupta (glitch de I2C), se omite esta
+      // actualización en vez de pintar basura; se reintenta en 1 s.
+      xSemaphoreGive(i2cMutex);
+    }
+
+    // Autocorrección: reinicializa el controlador del LCD cada 30 s para
+    // limpiar cualquier caracter corrupto o "?" causado por ruido en el
+    // bus I2C, sin esperar a que alguien note el problema y reinicie a mano.
+    if (t - ultimaReinit >= 30000) {
+      ultimaReinit = t;
+      xSemaphoreTake(i2cMutex, portMAX_DELAY);
+      lcd.init();
+      xSemaphoreGive(i2cMutex);
+      luzEncendida = true;
     }
 
     // Parpadeo del backlight: 300 ms encendido, 50 ms apagado.
     unsigned long tiempoEnEstado = t - ultimoParpadeo;
+    xSemaphoreTake(i2cMutex, portMAX_DELAY);
     if (luzEncendida && tiempoEnEstado >= 80) {
       lcd.noBacklight();
       luzEncendida = false;
@@ -736,7 +959,9 @@ void tareaLCD(void* parametro) {
       luzEncendida = true;
       ultimoParpadeo = t;
     }
+    xSemaphoreGive(i2cMutex);
 
+    esp_task_wdt_reset();
     delay(10);
   }
 }
