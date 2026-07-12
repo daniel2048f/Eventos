@@ -178,6 +178,7 @@ Alarma sec1[] = {
     {1, 9, 44, {RELE,MELODIA_ZELDA,LED_2}},
     {1, 9, 45, {SEQ_LEDS,RELE,LED_1}},
     {1, 8, 11, {MELODIA_MARIO, RELE}},
+    {1, 6, 10, {TONO_1200HZ,MELODIA_TETRIS,RELE}}
 };
 
 Alarma sec2[] = {
