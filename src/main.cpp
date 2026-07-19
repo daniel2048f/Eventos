@@ -53,6 +53,8 @@ int canal = 1;
 // =====================================================================
 #define SIN_ACCION    0   // No hace nada. Valor por defecto al dejar espacios vacíos.
 #define RELE          1   // Activa el relé.
+#define RELE2         15   // Activa el relé.
+#define RELE3         16   // Activa el relé.
 #define LED_1         2   // Enciende el LED 1.
 #define LED_2         3   // Enciende el LED 2.
 #define LED_3         4   // Enciende el LED 3.
@@ -178,7 +180,8 @@ Alarma sec1[] = {
     {1, 9, 44, {RELE,MELODIA_ZELDA,LED_2}},
     {1, 9, 45, {SEQ_LEDS,RELE,LED_1}},
     {1, 8, 11, {MELODIA_MARIO, RELE}},
-    {1, 6, 10, {TONO_1200HZ,MELODIA_TETRIS,RELE}}
+    {1, 6, 10, {TONO_1200HZ,MELODIA_TETRIS,RELE}},
+    {1,20,10, {RELE3}}
 };
 
 Alarma sec2[] = {
@@ -231,16 +234,42 @@ int    totalAlarmas = 0;  // Se actualiza en copiarSecuencia().
 void activarRele() {
   pinMode(PIN_RELE, OUTPUT);  // reforzar modo salida por si algo lo cambió
   Serial.println("RELE: iniciando pulsos");
-  for (int i = 0; i < 3; i++) {
-    Serial.printf("RELE: pulso %d ON\n", i + 1);
+    Serial.printf("RELE: pulso Constante ON\n");
     digitalWrite(PIN_RELE, HIGH);
-    delay(2000);
-    Serial.printf("RELE: pulso %d OFF\n", i + 1);
+    delay(6000);
     digitalWrite(PIN_RELE, LOW);
-    delay(2000);
-  }
   Serial.println("RELE: fin");
 }
+
+
+void activarRele2() {
+  pinMode(PIN_RELE, OUTPUT);
+  Serial.println("RELE2: iniciando pulsos");
+  for (int i = 0; i < 2; i++) {
+    Serial.printf("RELE2: pulso %d ON\n", i + 1);
+    digitalWrite(PIN_RELE, HIGH);
+    delay(1500);
+    Serial.printf("RELE2: pulso %d OFF\n", i + 1);
+    digitalWrite(PIN_RELE, LOW);
+    delay(1500);
+  }
+  Serial.println("RELE2: fin");
+}
+
+void activarRele3() {
+  pinMode(PIN_RELE, OUTPUT);
+  Serial.println("RELE3: iniciando pulsos");
+  for (int i = 0; i < 3; i++) {
+    Serial.printf("RELE3: pulso %d ON\n", i + 1);
+    digitalWrite(PIN_RELE, HIGH);
+    delay(1000);
+    Serial.printf("RELE3: pulso %d OFF\n", i + 1);
+    digitalWrite(PIN_RELE, LOW);
+    delay(1000);
+  }
+  Serial.println("RELE3: fin");
+}
+
 
 void encenderLED(int index) {
   digitalWrite(pinesLED[index], HIGH);
@@ -324,6 +353,8 @@ void ejecutarAccion(byte accion) {
   Serial.printf("ejecutarAccion: %d\n", accion);
   switch (accion) {
     case RELE:          activarRele();           break;
+    case RELE2:         activarRele2();           break;
+    case RELE3:         activarRele3();           break;
     case LED_1:         encenderLED(0);          break;
     case LED_2:         encenderLED(1);          break;
     case LED_3:         encenderLED(2);          break;
