@@ -31,6 +31,7 @@ bool fechaValida(const DateTime &dt);
 #define PIN_RELE   33
 #define PIN_I2C_SDA 21
 #define PIN_I2C_SCL 22
+#define PIN_PULSADOR 14  // Pulsador manual: +5V -> pulsador -> pin, y pull-down externo a GND.
 const int pinesLED[] = {25, 26, 27};
 int canal = 1;
 
@@ -667,6 +668,7 @@ void setup() {
   pinMode(PIN_BUZZER, OUTPUT);
   pinMode(PIN_RELE, OUTPUT);
   digitalWrite(PIN_RELE, LOW);
+  pinMode(PIN_PULSADOR, INPUT);  // resistencia de pull-down ya está en el circuito
 
   for (int i = 0; i < 3; i++) {
     pinMode(pinesLED[i], OUTPUT);
@@ -842,6 +844,13 @@ void loop() {
   digitalWrite(PIN_RELE, LOW);
   for (int i = 0; i < 3; i++) digitalWrite(pinesLED[i], LOW);
   noTone(PIN_BUZZER);
+
+  // Pulsador manual: mientras esté presionado, fuerza el relé encendido,
+  // sin afectar la secuencia automática (los eventos programados siguen
+  // corriendo igual; esto solo se superpone en cada ciclo del loop).
+  if (digitalRead(PIN_PULSADOR) == HIGH) {
+    digitalWrite(PIN_RELE, HIGH);
+  }
 
   // Al arrancar: esperar 3 s para que los periféricos estabilicen, luego marcar
   // el minuto actual como ya procesado para no disparar un evento a medias.
